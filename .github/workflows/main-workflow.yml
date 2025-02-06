@@ -1,0 +1,159 @@
+name: Main Workflow
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'package-lock.json'
+  pull_request:
+    branches:
+      - master
+
+  workflow_dispatch:
+
+jobs:
+  dispatch-push-pr:
+    name: Dispatch Push or PR
+    runs-on: ubuntu-latest
+    env:
+      workflow_dispatch: ${{ contains(github.event_name, 'workflow_dispatch') }}
+      pull_request: ${{ contains(github.event_name, 'pull_request') }}
+      
+
+    steps:
+    - id: changes
+      name: Get changed files
+      if: env.workflow_dispatch == 'false'
+      uses: trilom/file-changes-action@v1.2.4
+      with:
+        output: ','
+    - name: 'Analyze changes'
+      if: env.workflow_dispatch == 'false'
+      continue-on-error: true
+      # regex lookahead and lookbehind, \w don't work here
+      run: |
+        [[ "${{ github.event_name }}" == "push" ]] && echo "live=true" >> $GITHUB_ENV;
+        [[ "${{ steps.changes.outputs.files }}" =~ server/ ]] && echo "backend=true" >> $GITHUB_ENV;
+        [[ "${{ steps.changes.outputs.files }}" =~ src/|config\.js|eslintrc|\.env|public/ ]] && echo "frontend=true" >> $GITHUB_ENV;
+        [[ "${{ steps.changes.outputs.files }}" =~ package\.json ]] && echo "package_json=true" >> $GITHUB_ENV;
+        [[ "${{ steps.changes.outputs.files }}" =~ \.github/|actions/ ]] && echo "github_actions=true" >> $GITHUB_ENV;
+        [[ "${{ contains(github.event.head_commit.message, '[Code submission]') }}" == "true" || "${{ contains(github.head_ref, 'code-submission') }}" == "true" ]] && echo "code_submission=true" >> $GITHUB_ENV;
+        $pull_request && echo "heroku_review_app_url=https://coderush-pr-$(jq --raw-output .pull_request.number "$GITHUB_EVENT_PATH").herokuapp.com" >> $GITHUB_ENV;
+        exit 0;
+    - name: 'Setup other env variables'
+        # env variables are available only in next steps
+      run: |
+        [[ "${{ steps.changes.outputs.files }}" =~ firebase.json ]] || [[ $workflow_dispatch == true ]] || [[ $pull_request == true ]] || [[ $github_actions ]] || [[ $package_json ]] || { [[ $backend ]] && [[ $frontend ]]; } && echo "all=true" >> $GITHUB_ENV;
+        exit 0;
+    - name: DEBUG
+      run: |
+        echo "live=$live";
+        echo "backend=$backend";
+        echo "frontend=$frontend";
+        echo "package_json=$package_json";
+        echo "github_actions=$github_actions";
+        echo "all=$all";
+        echo "code_submission=$code_submission";
+        echo "heroku_review_app_url=$heroku_review_app_url";
+        echo "base_ref=${{ github.base_ref }}";
+        echo "head_ref=${{ github.head_ref }}";
+
+    - name: Checkout
+      uses: actions/checkout@v2
+      with:
+        token: ${{ secrets.GH_PERSONAL_TOKEN }}
+
+    - name: Setup Node.js
+      if: env.all || env.frontend || env.code_submission
+      uses: actions/setup-node@v1
+      with:
+        node-version: '12'
+    - uses: actions/cache@v2
+      if: env.all || env.frontend
+      with:
+        path: '**/node_modules'
+        key: ${{ runner.os }}-modules-${{ hashFiles('**/package-lock.json') }}
+    - name: Run npm install
+      if: env.all || env.frontend
+      run: |
+        npm install
+    - name: Set API URL for testing
+      if: (env.all || env.frontend) && !env.live
+      run: |
+        echo "VUE_APP_API_URL=$heroku_review_app_url" > .env.production
+    - name: Vue build
+      if: env.all || env.frontend
+      run: |
+        npm run build
+    - name: Stage all changes
+      if: env.all || env.frontend
+      run: |
+        git add .
+    - name: Check for changes
+      if: env.all || env.frontend
+      continue-on-error: true
+      run: |
+        ! git diff-index --quiet HEAD -- && echo "changes=true" >> $GITHUB_ENV;
+        $workflow_dispatch && echo "changes=true" >> $GITHUB_ENV;
+        $all && echo "changes=true" >> $GITHUB_ENV;
+        exit 0;
+    - name: DEBUG
+      run: |
+        echo "changes=$changes";   
+
+    - name: Deploy to Firebase live channel
+      if: env.live && env.changes && (env.frontend || env.all)
+      uses: FirebaseExtended/action-hosting-deploy@v0
+      with:
+        repoToken: '${{ secrets.GITHUB_TOKEN }}'
+        firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_CODERUSH_287723 }}'
+        channelId: live
+        projectId: coderush-287723
+
+    - name: Deploy to Firebase dev channel
+      if: (env.frontend || env.all) && !env.live
+      uses: FirebaseExtended/action-hosting-deploy@v0
+      with:
+        repoToken: '${{ secrets.GITHUB_TOKEN }}'
+        firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_CODERUSH_287723 }}'
+        channelId: dev
+        projectId: coderush-287723
+      env:
+        FIREBASE_CLI_PREVIEWS: hostingchannels
+
+
+    - name: Install packages for code submission
+      if: env.code_submission
+      run: |
+        npm install --no-package-lock --no-save @actions/core @actions/github faunadb
+    - name: Accept code submission
+      if: env.code_submission && env.live
+      run: |
+        node actions/add-code-submission-to-db.js && curl -X POST https://api.coderush.xyz${{ secrets.DB_CACHE_UPDATE_URL }}
+      env:
+        TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        FAUNA_KEY: ${{ secrets.FAUNA_KEY }}
+    - name: Accept code submission on dev database
+      if: env.code_submission && !env.live
+      run: |
+        node actions/add-code-submission-to-db.js && curl -X POST $heroku_review_app_url${{ secrets.DB_CACHE_UPDATE_URL }}
+      env:
+        TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        FAUNA_KEY: ${{ secrets.FAUNA_DEV_KEY }}
+
+    
+      # heroku will auto deploy pull request
+    - name: 'Remove unnecessary files'
+      if: env.live && (env.backend || env.all)
+      run: |
+        shopt -s extglob
+        rm -rfdv !("server"|"package.json"|"Procfile")
+    - name: Push backend to Heroku
+      if: env.live && (env.backend || env.all)
+      uses: akhileshns/heroku-deploy@v3.6.8
+      with:
+        heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
+        heroku_app_name: ${{ secrets.HEROKU_APP_NAME }}
+        heroku_email: ${{ secrets.HEROKU_EMAIL }}
